@@ -36,6 +36,9 @@ export interface RankWithRerankerOptions<T> {
   rerankModel?: string;
   /** Reranker API key. Default ZEROENTROPY_API_KEY (handled by @papercusp/rerank). */
   rerankApiKey?: string;
+  /** Hard cap (ms) on the rerank call; on timeout, degrade to retrieval order.
+   *  Default handled by @papercusp/rerank (DEFAULT_RERANK_TIMEOUT_MS). */
+  rerankTimeoutMs?: number;
   /**
    * Window kept after the rerank so the LLM pass can pull a buried product up
    * into the page and push accessories out. Default max(limit, 15).
@@ -63,6 +66,7 @@ export async function rankWithReranker<T>(
     instruction: opts.instruction,
     model: opts.rerankModel,
     apiKey: opts.rerankApiKey,
+    timeoutMs: opts.rerankTimeoutMs,
   });
 
   const W = opts.window ?? Math.max(opts.limit, 15);
