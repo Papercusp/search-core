@@ -1,5 +1,6 @@
 {
   "name": "@papercusp/search-core",
+  "type": "module",
   "version": "0.1.0",
   "private": true,
   "description": "Engine-agnostic search-relevance core: instruction-following rerank steering, live LLM category-match, brand-aware query rewrite, tiered escalation, and the shared eval-harness metric contract. Builds on @papercusp/rerank; no project (Typesense/PG/catalog-schema) deps. Shared across Papercusp and Restart.",
