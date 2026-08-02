@@ -55,6 +55,16 @@ export interface RankWithRerankerOptions<T> {
    */
   scorer?: (query: string, texts: string[]) => Promise<number[]>;
   /**
+   * Wall-clock bound on stage-1 scoring, forwarded to @papercusp/rerank. On
+   * expiry the rerank degrades to retrieval order through that library's single
+   * fail-safe seam — same path as an engine outage, so it never throws.
+   *
+   * Default: the library's backstop (20s), which is sized to catch a HANG, not
+   * to meet a latency contract. A user-facing caller should pass its own,
+   * much tighter budget.
+   */
+  rerankTimeoutMs?: number;
+  /**
    * Window kept after the rerank so the LLM pass can pull a buried product up
    * into the page and push accessories out. Default max(limit, 15).
    */
@@ -83,6 +93,7 @@ export async function rankWithReranker<T>(
     apiKey: opts.rerankApiKey,
     engine: opts.engine,
     scorer: opts.scorer,
+    timeoutMs: opts.rerankTimeoutMs,
   });
 
   const W = opts.window ?? Math.max(opts.limit, 15);
