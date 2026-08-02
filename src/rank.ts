@@ -14,7 +14,7 @@
  * gate flags. Fail-safe throughout — a rerank or LLM outage degrades to
  * retrieval order, never an error.
  */
-import { rerank } from '@papercusp/rerank';
+import { rerank, type RerankEngine } from '@papercusp/rerank';
 import { shouldEscalate, type EscalationOptions } from './escalation';
 import { llmRerank, type LlmRerankOptions } from './llm-rerank';
 
@@ -36,6 +36,24 @@ export interface RankWithRerankerOptions<T> {
   rerankModel?: string;
   /** Reranker API key. Default ZEROENTROPY_API_KEY (handled by @papercusp/rerank). */
   rerankApiKey?: string;
+  /**
+   * Which cross-encoder scores stage 1, forwarded to @papercusp/rerank:
+   * `local` (an ONNX cross-encoder — no key, no network, no per-call cost) or
+   * `zeroentropy` (the hosted zerank API). Default: the lib's default
+   * (`zeroentropy`), so an existing consumer's behavior is unchanged.
+   */
+  engine?: RerankEngine;
+  /**
+   * Scoring override for `engine: 'local'` — returns scores index-aligned with
+   * `docs`, and MAY throw.
+   *
+   * This is the seam a REMOTE local-model host (e.g. a sidecar process serving
+   * one warm model for the whole box) reaches the stages below through, without
+   * search-core learning anything about transport. A throw is caught by
+   * @papercusp/rerank's single fail-safe seam, so a scorer outage degrades to
+   * retrieval order exactly like a missing runtime does.
+   */
+  scorer?: (query: string, texts: string[]) => Promise<number[]>;
   /**
    * Window kept after the rerank so the LLM pass can pull a buried product up
    * into the page and push accessories out. Default max(limit, 15).
@@ -63,6 +81,8 @@ export async function rankWithReranker<T>(
     instruction: opts.instruction,
     model: opts.rerankModel,
     apiKey: opts.rerankApiKey,
+    engine: opts.engine,
+    scorer: opts.scorer,
   });
 
   const W = opts.window ?? Math.max(opts.limit, 15);
