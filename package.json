@@ -19,7 +19,7 @@
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
-  "dependencies": {
+  "peerDependencies": {
     "@papercusp/rerank": "*"
   },
   "devDependencies": {
