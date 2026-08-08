@@ -30,5 +30,21 @@ export { shouldEscalate, type EscalationOptions } from './escalation';
 // Shared eval-harness metric contract
 export { dcg, ndcg, ndcgAtK, precisionAtK, accessoryAtK } from './metrics';
 
+// Eval harness over those metrics. `recallAtK` lives HERE, not in metrics.ts,
+// because unlike every metric there it cannot be computed from the ranking
+// alone — it needs an externally-known relevant set. That is also why the
+// metrics above cannot see a MISS, and why this module exists.
+export {
+  evaluateRelevance,
+  assertRelevance,
+  recallAtK,
+  type RelevanceEvalCoverage,
+  type RelevanceGroundTruth,
+  type RelevanceEvalInput,
+  type RelevanceEvalResult,
+  type RelevanceFloor,
+  type RelevanceAssertion,
+} from './relevance-eval';
+
 // Two-stage orchestrator
 export { rankWithReranker, type RankDoc, type RankWithRerankerOptions } from './rank';
