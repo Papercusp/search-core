@@ -37,6 +37,48 @@ describe('rankWithReranker', () => {
     expect(out.map((r) => r.name)).toEqual(['A', 'B']);
   });
 
+  /**
+   * WI-37670: stage-1 engagement must be OBSERVABLE. A call that scored nothing
+   * returns retrieval order, which carries no provenance in the returned rows —
+   * so without this callback a caller measuring the reranker's effect reads a
+   * confident 0.000 delta from a stage that never ran.
+   */
+  describe('onRerankStage', () => {
+    const rows = [{ name: 'A' }, { name: 'B' }, { name: 'C' }];
+    const docs = rows.map((row) => ({ id: row.name, text: row.name, row }));
+
+    it('reports scored: 0 and forwards the degrade reason when the stage passed through', async () => {
+      rerankMock.mockImplementation(async (_q, d, opts) => {
+        (opts as { onDegrade?: (r: string) => void } | undefined)?.onDegrade?.('timeout');
+        return (d as typeof docs).map(({ row }) => rr(row, 0, false));
+      });
+      const seen: Array<{ scored: number; total: number; degradeReason?: string }> = [];
+      await rankWithReranker('q', docs, { limit: 2, onRerankStage: (i) => void seen.push(i) });
+      expect(seen).toEqual([{ scored: 0, total: 3, degradeReason: 'timeout' }]);
+    });
+
+    /** The control: a healthy rerank must NOT look like a degrade. */
+    it('reports the scored count with NO degradeReason when the stage ran', async () => {
+      rerankMock.mockResolvedValue(rows.map((row, i) => rr(row, 0.9 - i * 0.1)));
+      const seen: Array<{ scored: number; total: number; degradeReason?: string }> = [];
+      await rankWithReranker('q', docs, { limit: 2, onRerankStage: (i) => void seen.push(i) });
+      expect(seen).toEqual([{ scored: 3, total: 3 }]);
+    });
+
+    /**
+     * A PARTIAL degrade — some pairs scored, some dropped by the lib's per-pair
+     * fail-safe. `scored < total` is the only signal of it, and reporting it
+     * before the window/limit slicing is what keeps it a fact about the RERANKER
+     * rather than about the page size.
+     */
+    it('counts the reranker output, not the sliced page', async () => {
+      rerankMock.mockResolvedValue([rr(rows[0], 0.9), rr(rows[1], 0.8, false), rr(rows[2], 0.7)]);
+      const seen: Array<{ scored: number; total: number }> = [];
+      await rankWithReranker('q', docs, { limit: 1, onRerankStage: (i) => void seen.push(i) });
+      expect(seen).toEqual([{ scored: 2, total: 3 }]);
+    });
+  });
+
   it('tiered escalation with a clear winner → LLM pass is skipped', async () => {
     const rows = [{ name: 'A' }, { name: 'B' }];
     rerankMock.mockResolvedValue([rr(rows[0], 0.95), rr(rows[1], 0.2)]);

@@ -14,7 +14,7 @@
  * gate flags. Fail-safe throughout — a rerank or LLM outage degrades to
  * retrieval order, never an error.
  */
-import { rerank, type RerankEngine } from '@papercusp/rerank';
+import { rerank, type RerankDegradeReason, type RerankEngine } from '@papercusp/rerank';
 import { shouldEscalate, type EscalationOptions } from './escalation';
 import { llmRerank, type LlmRerankOptions } from './llm-rerank';
 
@@ -80,6 +80,30 @@ export interface RankWithRerankerOptions<T> {
   escalation?: EscalationOptions;
   /** Live LLM category-match pass (§1e). Omit to skip it entirely. */
   llm?: LlmRerankOptions<T>;
+  /**
+   * Observe whether stage 1 actually RANKED anything. Called exactly once per
+   * invocation, immediately after the rerank, on every path.
+   *
+   * `scored: 0` means the cross-encoder scored nothing and this call returned
+   * RETRIEVAL ORDER — behaviourally identical to a caller with no reranker at
+   * all, and (WI-37670) invisible from the returned rows, which carry no
+   * provenance. `degradeReason` names WHY, straight from @papercusp/rerank's
+   * single fail-safe seam: notably `'timeout'` (the stage was too slow for
+   * `rerankTimeoutMs`) vs `'scoring-failed'` (the engine could not score).
+   *
+   * Measured 2026-08-10 on the WI-37653 bench: 238/238 queries returned
+   * retrieval order with no signal anywhere, because four concurrent calls
+   * serialize on ONE inference thread and each one's wall clock is therefore
+   * ~4x its own compute — well past a budget sized against a single call.
+   */
+  onRerankStage?: (info: {
+    /** Rows the cross-encoder scored. 0 ⇒ this call returned retrieval order. */
+    scored: number;
+    /** Rows handed to it. */
+    total: number;
+    /** Present only when the fail-safe passthrough fired. */
+    degradeReason?: RerankDegradeReason;
+  }) => void;
 }
 
 export async function rankWithReranker<T>(
@@ -87,6 +111,7 @@ export async function rankWithReranker<T>(
   docs: Array<RankDoc<T>>,
   opts: RankWithRerankerOptions<T>,
 ): Promise<T[]> {
+  let degradeReason: RerankDegradeReason | undefined;
   const reranked = await rerank(query, docs, {
     instruction: opts.instruction,
     model: opts.rerankModel,
@@ -94,6 +119,16 @@ export async function rankWithReranker<T>(
     engine: opts.engine,
     scorer: opts.scorer,
     timeoutMs: opts.rerankTimeoutMs,
+    onDegrade: (reason) => {
+      degradeReason = reason;
+    },
+  });
+  // Report engagement BEFORE the shaping below, so the count is the reranker's
+  // own output and not an artefact of windowing/slicing further down.
+  opts.onRerankStage?.({
+    scored: reranked.filter((r) => r.reranked).length,
+    total: docs.length,
+    ...(degradeReason ? { degradeReason } : {}),
   });
 
   const W = opts.window ?? Math.max(opts.limit, 15);
