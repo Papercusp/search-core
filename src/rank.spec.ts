@@ -79,6 +79,47 @@ describe('rankWithReranker', () => {
     });
   });
 
+  /**
+   * WIDENING `limit` MUST NOT PERTURB THE PREFIX.
+   *
+   * A caller that reorders the whole candidate pool without cutting it (the
+   * documented `limit: rows.length` case) has to be able to treat its top-k as
+   * THE SAME PAGE a `limit: k` call would have produced — P-038's `--pool-all`
+   * bench arm compares against runs that judged only the page, and if the page
+   * moved, the two runs are measuring different rankings and every number is
+   * uncomparable.
+   *
+   * The property is not free: `limit` feeds `W = window ?? max(limit, 15)` as
+   * well as the final slice, so it is only safe because both cut an
+   * already-fully-sorted list. This pins it against a future change that, say,
+   * windows BEFORE sorting or makes the bucket size depend on the limit.
+   *
+   * ⚠ Scoped to the no-`llm` path deliberately: the tiered escalation reorders
+   * (rather than cuts) whatever list it is handed, so with an LLM pass
+   * configured a longer slice legitimately CAN produce a different prefix.
+   */
+  it('a WIDER limit keeps the same prefix — reordering the whole pool leaves the page unchanged', async () => {
+    const rows = Array.from({ length: 24 }, (_, i) => ({ name: `R${i}`, q: i }));
+    // Deliberately adversarial, and it has to be: the BEST candidates sit at the
+    // TAIL of retrieval order (the buried-hit case a reranker exists for), so
+    // the page is drawn from beyond `W` at limit=10. Score them the other way
+    // round — best at the head — and a window-BEFORE-sort implementation would
+    // produce the very same prefix and this test would pass while asserting
+    // nothing. Scores also collide into shared buckets so the qualityScore
+    // tiebreak and V8's sort stability both do real work.
+    const scored = rows.map((row, i) => rr(row, (i + 1) / 24 + (i % 3) * 0.001));
+    const docs = rows.map((row) => ({ id: row.name, text: row.name, row }));
+
+    rerankMock.mockResolvedValue(scored);
+    const page = await rankWithReranker('q', docs, { limit: 10, qualityScore: (r) => r.q ?? 0 });
+    rerankMock.mockResolvedValue(scored);
+    const pool = await rankWithReranker('q', docs, { limit: rows.length, qualityScore: (r) => r.q ?? 0 });
+
+    expect(pool).toHaveLength(24); // the pool arm really did keep every candidate
+    expect(page).toHaveLength(10);
+    expect(pool.slice(0, 10).map((r) => r.name)).toEqual(page.map((r) => r.name));
+  });
+
   it('tiered escalation with a clear winner → LLM pass is skipped', async () => {
     const rows = [{ name: 'A' }, { name: 'B' }];
     rerankMock.mockResolvedValue([rr(rows[0], 0.95), rr(rows[1], 0.2)]);
