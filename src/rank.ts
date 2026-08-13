@@ -104,6 +104,28 @@ export interface RankWithRerankerOptions<T> {
     /** Present only when the fail-safe passthrough fired. */
     degradeReason?: RerankDegradeReason;
   }) => void;
+  /**
+   * Hand out stage 1's PER-ROW cross-encoder scores. Called exactly once,
+   * immediately after the rerank and BEFORE the bucketing/windowing/slicing
+   * below, so the values are the reranker's own output rather than an artefact
+   * of shaping — the same reason {@link onRerankStage} is called there.
+   *
+   * This is the only way to observe those scores: `onRerankStage` reports
+   * COUNTS, and the returned rows carry no provenance, so the one number in the
+   * stack that is a true query↔document relevance MAGNITUDE is otherwise
+   * discarded microseconds after it is computed. A caller wanting to THRESHOLD
+   * on relevance needs it: a threshold on a fused retrieval score is a rank
+   * cutoff in disguise, because RRF is rank-derived and its output is in
+   * nobody's units.
+   *
+   * ⚠ `score` is `null` — never `0` — for a row the cross-encoder did not
+   * score. @papercusp/rerank's degrade path returns `{ score: 0, reranked:
+   * false }`, so a caller reading the raw number cannot distinguish "judged
+   * irrelevant" from "never judged", and any floor computed over those zeros
+   * silently counts every degraded row as maximally irrelevant. Normalising to
+   * `null` here makes that distinction unmissable at the type level.
+   */
+  onRerankScores?: (rows: Array<{ row: T; score: number | null }>) => void;
 }
 
 export async function rankWithReranker<T>(
@@ -130,6 +152,9 @@ export async function rankWithReranker<T>(
     total: docs.length,
     ...(degradeReason ? { degradeReason } : {}),
   });
+  // Same placement rationale, and `null` (not 0) for a row that was never
+  // scored — see the field doc; the degrade path reports `score: 0`.
+  opts.onRerankScores?.(reranked.map((r) => ({ row: r.row, score: r.reranked ? r.score : null })));
 
   const W = opts.window ?? Math.max(opts.limit, 15);
   const bucket = opts.scoreBucket ?? 20;
