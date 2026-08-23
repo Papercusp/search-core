@@ -1,11 +1,13 @@
-import { defineConfig } from 'vitest/config';
+import { defineVitestConfig } from '@papercusp/test-config/vitest-config';
+import { mergeConfig } from 'vitest/config';
 
-export default defineConfig({
-  root: __dirname,
-  test: {
-    environment: 'node',
-    globals: true,
+export default mergeConfig(
+  defineVitestConfig({
+    layer: 'unit',
     include: ['src/**/*.spec.ts'],
-    exclude: ['**/node_modules/**'],
+  }),
+  {
+    root: __dirname,
+    test: { globals: true },
   },
-});
+);
