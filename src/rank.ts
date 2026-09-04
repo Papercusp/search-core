@@ -14,7 +14,7 @@
  * gate flags. Fail-safe throughout — a rerank or LLM outage degrades to
  * retrieval order, never an error.
  */
-import { rerank } from '@papercusp/rerank';
+import { rerank, type RerankDegradeReason, type RerankEngine } from '@papercusp/rerank';
 import { shouldEscalate, type EscalationOptions } from './escalation';
 import { llmRerank, type LlmRerankOptions } from './llm-rerank';
 
@@ -36,8 +36,33 @@ export interface RankWithRerankerOptions<T> {
   rerankModel?: string;
   /** Reranker API key. Default ZEROENTROPY_API_KEY (handled by @papercusp/rerank). */
   rerankApiKey?: string;
-  /** Hard cap (ms) on the rerank call; on timeout, degrade to retrieval order.
-   *  Default handled by @papercusp/rerank (DEFAULT_RERANK_TIMEOUT_MS). */
+  /**
+   * Which cross-encoder scores stage 1, forwarded to @papercusp/rerank:
+   * `local` (an ONNX cross-encoder — no key, no network, no per-call cost) or
+   * `zeroentropy` (the hosted zerank API). Default: the lib's default
+   * (`zeroentropy`), so an existing consumer's behavior is unchanged.
+   */
+  engine?: RerankEngine;
+  /**
+   * Scoring override for `engine: 'local'` — returns scores index-aligned with
+   * `docs`, and MAY throw.
+   *
+   * This is the seam a REMOTE local-model host (e.g. a sidecar process serving
+   * one warm model for the whole box) reaches the stages below through, without
+   * search-core learning anything about transport. A throw is caught by
+   * @papercusp/rerank's single fail-safe seam, so a scorer outage degrades to
+   * retrieval order exactly like a missing runtime does.
+   */
+  scorer?: (query: string, texts: string[]) => Promise<number[]>;
+  /**
+   * Wall-clock bound on stage-1 scoring, forwarded to @papercusp/rerank. On
+   * expiry the rerank degrades to retrieval order through that library's single
+   * fail-safe seam — same path as an engine outage, so it never throws.
+   *
+   * Default: the library's backstop (20s), which is sized to catch a HANG, not
+   * to meet a latency contract. A user-facing caller should pass its own,
+   * much tighter budget.
+   */
   rerankTimeoutMs?: number;
   /**
    * Window kept after the rerank so the LLM pass can pull a buried product up
@@ -55,6 +80,52 @@ export interface RankWithRerankerOptions<T> {
   escalation?: EscalationOptions;
   /** Live LLM category-match pass (§1e). Omit to skip it entirely. */
   llm?: LlmRerankOptions<T>;
+  /**
+   * Observe whether stage 1 actually RANKED anything. Called exactly once per
+   * invocation, immediately after the rerank, on every path.
+   *
+   * `scored: 0` means the cross-encoder scored nothing and this call returned
+   * RETRIEVAL ORDER — behaviourally identical to a caller with no reranker at
+   * all, and (WI-37670) invisible from the returned rows, which carry no
+   * provenance. `degradeReason` names WHY, straight from @papercusp/rerank's
+   * single fail-safe seam: notably `'timeout'` (the stage was too slow for
+   * `rerankTimeoutMs`) vs `'scoring-failed'` (the engine could not score).
+   *
+   * Measured 2026-08-10 on the WI-37653 bench: 238/238 queries returned
+   * retrieval order with no signal anywhere, because four concurrent calls
+   * serialize on ONE inference thread and each one's wall clock is therefore
+   * ~4x its own compute — well past a budget sized against a single call.
+   */
+  onRerankStage?: (info: {
+    /** Rows the cross-encoder scored. 0 ⇒ this call returned retrieval order. */
+    scored: number;
+    /** Rows handed to it. */
+    total: number;
+    /** Present only when the fail-safe passthrough fired. */
+    degradeReason?: RerankDegradeReason;
+  }) => void;
+  /**
+   * Hand out stage 1's PER-ROW cross-encoder scores. Called exactly once,
+   * immediately after the rerank and BEFORE the bucketing/windowing/slicing
+   * below, so the values are the reranker's own output rather than an artefact
+   * of shaping — the same reason {@link onRerankStage} is called there.
+   *
+   * This is the only way to observe those scores: `onRerankStage` reports
+   * COUNTS, and the returned rows carry no provenance, so the one number in the
+   * stack that is a true query↔document relevance MAGNITUDE is otherwise
+   * discarded microseconds after it is computed. A caller wanting to THRESHOLD
+   * on relevance needs it: a threshold on a fused retrieval score is a rank
+   * cutoff in disguise, because RRF is rank-derived and its output is in
+   * nobody's units.
+   *
+   * ⚠ `score` is `null` — never `0` — for a row the cross-encoder did not
+   * score. @papercusp/rerank's degrade path returns `{ score: 0, reranked:
+   * false }`, so a caller reading the raw number cannot distinguish "judged
+   * irrelevant" from "never judged", and any floor computed over those zeros
+   * silently counts every degraded row as maximally irrelevant. Normalising to
+   * `null` here makes that distinction unmissable at the type level.
+   */
+  onRerankScores?: (rows: Array<{ row: T; score: number | null }>) => void;
 }
 
 export async function rankWithReranker<T>(
@@ -62,12 +133,28 @@ export async function rankWithReranker<T>(
   docs: Array<RankDoc<T>>,
   opts: RankWithRerankerOptions<T>,
 ): Promise<T[]> {
+  let degradeReason: RerankDegradeReason | undefined;
   const reranked = await rerank(query, docs, {
     instruction: opts.instruction,
     model: opts.rerankModel,
     apiKey: opts.rerankApiKey,
+    engine: opts.engine,
+    scorer: opts.scorer,
     timeoutMs: opts.rerankTimeoutMs,
+    onDegrade: (reason) => {
+      degradeReason = reason;
+    },
   });
+  // Report engagement BEFORE the shaping below, so the count is the reranker's
+  // own output and not an artefact of windowing/slicing further down.
+  opts.onRerankStage?.({
+    scored: reranked.filter((r) => r.reranked).length,
+    total: docs.length,
+    ...(degradeReason ? { degradeReason } : {}),
+  });
+  // Same placement rationale, and `null` (not 0) for a row that was never
+  // scored — see the field doc; the degrade path reports `score: 0`.
+  opts.onRerankScores?.(reranked.map((r) => ({ row: r.row, score: r.reranked ? r.score : null })));
 
   const W = opts.window ?? Math.max(opts.limit, 15);
   const bucket = opts.scoreBucket ?? 20;
