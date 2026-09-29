@@ -28,7 +28,9 @@
  *
  * Arms: `parent` scores a row by its parent vector alone (the status quo, and
  * gist mode). `<splitter>@<k>` scores it by the best of its parent vector and
- * its first k chunk vectors (retrieve mode). Every splitter is embedded once at
+ * its first k chunk vectors (retrieve mode); `<splitter>@<k>-m<δ>` subtracts a
+ * margin δ from every chunk similarity first, so a chunk displaces a row only
+ * when it beats that row by more than δ. Every splitter is embedded once at
  * the largest k in the sweep and smaller caps are scored as PREFIXES, which is
  * sound only because a splitter's cap truncates its output (the contract on
  * {@link BenchSplitter}).
@@ -96,6 +98,11 @@ export interface ChunkingBenchInput {
   /** Chunk caps to score, e.g. [8, 16, 32]. */
   maxChunks: number[];
   /**
+   * Margins subtracted from chunk similarities before pooling. Default [0]
+   * (plain best-match). Every cap is scored at every margin.
+   */
+  chunkMargins?: number[];
+  /**
    * Rows whose `text` is at or under this length get no chunks: it is the
    * parent vector's window, so their parent vector already saw all of them.
    */
@@ -131,6 +138,7 @@ export interface ArmResult {
   /** Null for the `parent` arm. */
   splitter: string | null;
   maxChunks: number | null;
+  chunkMargin: number | null;
   tail: ArmClassResult;
   short: ArmClassResult;
 }
@@ -275,16 +283,20 @@ export function summarizeRankings(
   return { n, mrr: rr / n, recallAt1: r1 / n, recallAt5: r5 / n, meanRank: sum / n, ranks };
 }
 
-/** A row's best similarity to a query over its parent vector and its first k chunks. */
+/**
+ * A row's best similarity to a query over its parent vector and its first k
+ * chunks, each chunk similarity lowered by `margin` first.
+ */
 export function pooledScore(
   query: readonly number[],
   parent: readonly number[],
   chunks: ReadonlyArray<readonly number[]>,
   maxChunks: number,
+  margin = 0,
 ): number {
   let best = cosine(query, parent);
   const k = Math.min(maxChunks, chunks.length);
-  for (let i = 0; i < k; i++) best = Math.max(best, cosine(query, chunks[i]));
+  for (let i = 0; i < k; i++) best = Math.max(best, cosine(query, chunks[i]) - margin);
   return best;
 }
 
@@ -292,6 +304,7 @@ interface ArmSpec {
   label: string;
   splitter: string | null;
   maxChunks: number | null;
+  chunkMargin: number | null;
 }
 
 interface FoldVectors {
@@ -347,7 +360,7 @@ function rankFold(v: FoldVectors, arm: ArmSpec): { rankings: string[][]; contain
     const scores = v.keys.map((_, ri) =>
       arm.splitter === null
         ? cosine(q, v.parent[ri])
-        : pooledScore(q, v.parent[ri], v.chunkVecs[arm.splitter][ri], arm.maxChunks ?? 0),
+        : pooledScore(q, v.parent[ri], v.chunkVecs[arm.splitter][ri], arm.maxChunks ?? 0, arm.chunkMargin ?? 0),
     );
     rankings.push(rankKeys(v.keys, scores, probe.key));
     if (arm.splitter !== null) {
@@ -368,10 +381,15 @@ export async function runChunkingBench(input: ChunkingBenchInput): Promise<Chunk
   const caps = [...new Set(input.maxChunks)].filter((k) => k > 0).sort((a, b) => a - b);
   if (caps.length === 0) throw new Error('runChunkingBench: maxChunks needs at least one positive cap');
   const maxCap = caps[caps.length - 1];
+  const margins = [...new Set(input.chunkMargins ?? [0])].sort((a, b) => a - b);
   const splitterNames = Object.keys(input.splitters);
   const arms: ArmSpec[] = [
-    { label: 'parent', splitter: null, maxChunks: null },
-    ...splitterNames.flatMap((s) => caps.map((k) => ({ label: `${s}@${k}`, splitter: s, maxChunks: k }))),
+    { label: 'parent', splitter: null, maxChunks: null, chunkMargin: null },
+    ...splitterNames.flatMap((s) =>
+      caps.flatMap((k) =>
+        margins.map((m) => ({ label: m === 0 ? `${s}@${k}` : `${s}@${k}-m${m}`, splitter: s, maxChunks: k, chunkMargin: m })),
+      ),
+    ),
   ];
 
   const vectorized: FoldVectors[] = [];
@@ -445,6 +463,7 @@ export async function runChunkingBench(input: ChunkingBenchInput): Promise<Chunk
       label: arm.label,
       splitter: arm.splitter,
       maxChunks: arm.maxChunks,
+      chunkMargin: arm.chunkMargin,
       tail: classResult(arm, 'tail', byClass.tail),
       short: classResult(arm, 'short', byClass.short),
     })),
@@ -479,7 +498,8 @@ export interface ChunkingDecision {
 /**
  * Apply a {@link ChunkingDecisionRule}. Qualifying arms are those within the
  * short-row budget; among them the best tail MRR wins, ties (within
- * `mrrTolerance`) going to the smaller cap and then to splitter order.
+ * `mrrTolerance`) going to the smaller cap, then the smaller margin, then
+ * splitter order.
  */
 export function decideChunking(result: ChunkingBenchResult, rule: ChunkingDecisionRule): ChunkingDecision {
   const parent = result.arms.find((a) => a.splitter === null);
@@ -510,7 +530,12 @@ export function decideChunking(result: ChunkingBenchResult, rule: ChunkingDecisi
   const order = [...new Set(pooled.map((a) => a.splitter))];
   const chosen = eligible
     .filter((a) => (a.tail.mrr ?? 0) >= best - rule.mrrTolerance)
-    .sort((a, b) => (a.maxChunks ?? 0) - (b.maxChunks ?? 0) || order.indexOf(a.splitter) - order.indexOf(b.splitter))[0];
+    .sort(
+      (a, b) =>
+        (a.maxChunks ?? 0) - (b.maxChunks ?? 0) ||
+        (a.chunkMargin ?? 0) - (b.chunkMargin ?? 0) ||
+        order.indexOf(a.splitter) - order.indexOf(b.splitter),
+    )[0];
   const gain = (chosen.tail.mrr ?? 0) - baseTail;
   if (gain < rule.minTailMrrGain) {
     reasons.push(`best arm ${chosen.label} gains ${gain.toFixed(4)} tail MRR, under ${rule.minTailMrrGain}`);

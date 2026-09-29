@@ -198,6 +198,11 @@ describe('pooledScore', () => {
     expect(pooledScore(q, parent, chunks, 1)).toBeCloseTo(cosine(q, [1, 1]), 10);
     expect(pooledScore(q, parent, chunks, 2)).toBeCloseTo(1, 10);
   });
+
+  it('lowers chunk similarities by the margin but never the parent’s', () => {
+    expect(pooledScore([1, 0], [0, 1], [[1, 0]], 1, 0.3)).toBeCloseTo(0.7, 10);
+    expect(pooledScore([1, 0], [1, 0], [[1, 0]], 1, 0.3)).toBeCloseTo(1, 10);
+  });
 });
 
 // ─── the bench ─────────────────────────────────────────────────────────────
@@ -272,6 +277,26 @@ describe('runChunkingBench', () => {
     expect(pooled.short.mrr!).toBeLessThan(parent.short.mrr!);
   });
 
+  it('scores every cap at every margin, and a large enough margin undoes the demotion', async () => {
+    const s = shortRow(0);
+    const probe = drawShortProbe(s, 240)!;
+    const tokens = probe.text.split(/\s+/).filter(Boolean).reverse().join(' ');
+    const l: BenchRow = row('L', `${words('headq', 300)} ${Array(12).fill(tokens).join(' ')}`);
+    const res = await runChunkingBench({
+      folds: [{ rows: [s, l, shortRow(1)], probes: [probe] }],
+      splitters: { window: windows },
+      maxChunks: [2, 4],
+      chunkMargins: [0, 1],
+      minChunkTextChars: CUT,
+      embed: bowEmbed,
+    });
+    expect(res.arms.map((a) => a.label)).toEqual(['parent', 'window@2', 'window@2-m1', 'window@4', 'window@4-m1']);
+    const margined = res.arms.find((a) => a.label === 'window@4-m1')!;
+    expect(margined.chunkMargin).toBe(1);
+    // Cosine never exceeds 1, so a margin of 1 leaves every chunk below its parent.
+    expect(margined.short.worsened).toBe(0);
+  });
+
   it('never improves a short probe’s rank by pooling (pooling only raises OTHER rows)', async () => {
     for (let seed = 0; seed < 5; seed++) {
       const longs = Array.from({ length: 4 }, (_, i) => longRow(seed * 10 + i));
@@ -340,9 +365,9 @@ describe('decideChunking', () => {
       ambiguousProbesDropped: 0,
       splitters: {},
       arms: [
-        { label: 'parent', splitter: null, maxChunks: null, tail: cls(0.2), short: cls(0.9) },
-        { label: 'window@8', splitter: 'window', maxChunks: 8, tail: cls(0.8), short: cls(0.7) },
-        { label: 'window@4', splitter: 'window', maxChunks: 4, tail: cls(0.6), short: cls(0.9) },
+        { label: 'parent', splitter: null, maxChunks: null, chunkMargin: null, tail: cls(0.2), short: cls(0.9) },
+        { label: 'window@8', splitter: 'window', maxChunks: 8, chunkMargin: 0, tail: cls(0.8), short: cls(0.7) },
+        { label: 'window@4', splitter: 'window', maxChunks: 4, chunkMargin: 0, tail: cls(0.6), short: cls(0.9) },
       ],
     };
     const d = decideChunking(result, RULE);

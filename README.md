@@ -20,6 +20,39 @@ the valuable two-stage relevance logic that used to live inside Restart's
   LLM pass → slice).
 - **Metrics** — `dcg`, `ndcg`, `ndcgAtK`, `precisionAtK`, `accessoryAtK`: the
   shared eval-harness contract so both repos measure relevance identically.
+- **`runChunkingBench(input)` / `decideChunking(result, rule)`** — the chunking
+  retrieval bench. Does splitting long rows into separately embedded chunks make
+  text past the embedder's window findable, and does best-match pooling demote
+  the short rows that were never chunked? Rank-based (MRR, recall@1/@5 of the
+  true parent among the other rows of its fold), with the corpus, the splitters
+  and the embedder injected. See [the chunking bench](#the-chunking-bench).
+
+## The chunking bench
+
+```ts
+import { runChunkingBench, decideChunking, drawTailProbe, drawShortProbe } from '@papercusp/search-core';
+
+const result = await runChunkingBench({
+  folds: [{ rows, probes }],            // rows: { key, text, header?, parentDoc }
+  splitters: { window: (row, max) => splitWindows(row.text, { size: 1500, overlap: 250, maxChunks: max }) },
+  maxChunks: [8, 16, 32],               // embedded once at 32; smaller caps scored as prefixes
+  minChunkTextChars: 2000,              // the parent vector's window
+  embed: (kind, texts) => myEmbedder(kind, texts),  // 'document' | 'query', production's space
+});
+const decision = decideChunking(result, {
+  minTailProbes: 20, minShortProbes: 20, minTailMrrGain: 0.05, maxShortMrrDrop: 0, mrrTolerance: 0.02,
+});
+```
+
+- `parentDoc` is the exact text the host's parent vector embeds; `drawTailProbe`
+  only returns a window that does not occur in it, and `drawShortProbe` only one
+  that does.
+- A splitter's cap must truncate (`split(row, k)` is the first k of
+  `split(row, K)`), because smaller caps are scored as prefixes.
+- Ties rank AGAINST the true parent, and a probe whose text also occurs in
+  another row of its fold is dropped and counted, never scored.
+- Papercusp's CLI over its own collections:
+  `packages/operator-core/lib/memory/bench/chunking-bench-cli.ts`.
 
 ## Design
 
