@@ -307,14 +307,20 @@ interface ArmSpec {
   chunkMargin: number | null;
 }
 
+/**
+ * One fold, embedded and reduced to similarities. Every arm is a different
+ * reading of the same probe × row and probe × row × chunk cosines, so they are
+ * computed once here and never per arm.
+ */
 interface FoldVectors {
   keys: string[];
-  parent: number[][];
-  /** splitter → row index → chunk bodies / vectors (empty for unchunked rows). */
+  /** splitter → row index → chunk bodies (empty for unchunked rows). */
   chunkText: Record<string, string[][]>;
-  chunkVecs: Record<string, number[][][]>;
   probes: BenchProbe[];
-  probeVecs: number[][];
+  /** probe index → row index → cosine to the row's parent vector. */
+  parentSim: number[][];
+  /** splitter → probe index → row index → cosine to each chunk, in chunk order. */
+  chunkSim: Record<string, number[][][]>;
 }
 
 function chunkDoc(row: BenchRow, chunk: string): string {
@@ -332,9 +338,11 @@ async function vectorizeFold(
   const probes = fold.probes.filter((p) => !rows.some((r) => r.key !== p.key && r.text.includes(p.text)));
   const ambiguous = fold.probes.length - probes.length;
 
+  const probeVecs = probes.length > 0 ? await input.embed('query', probes.map((p) => p.text)) : [];
   const parent = await input.embed('document', rows.map((r) => r.parentDoc));
+  const parentSim = probeVecs.map((q) => parent.map((d) => cosine(q, d)));
   const chunkText: Record<string, string[][]> = {};
-  const chunkVecs: Record<string, number[][][]> = {};
+  const chunkSim: Record<string, number[][][]> = {};
   for (const [name, split] of Object.entries(input.splitters)) {
     const perRow = rows.map((r) => (r.text.length > input.minChunkTextChars ? split(r, maxCap) : []));
     const flatDocs = perRow.flatMap((cs, i) => cs.map((c) => chunkDoc(rows[i], c)));
@@ -346,22 +354,26 @@ async function vectorizeFold(
       off += cs.length;
     }
     chunkText[name] = perRow;
-    chunkVecs[name] = vecs;
+    chunkSim[name] = probeVecs.map((q) => vecs.map((cv) => cv.map((c) => cosine(q, c))));
   }
-  const probeVecs = probes.length > 0 ? await input.embed('query', probes.map((p) => p.text)) : [];
-  return { vectors: { keys: rows.map((r) => r.key), parent, chunkText, chunkVecs, probes, probeVecs }, ambiguous };
+  return { vectors: { keys: rows.map((r) => r.key), chunkText, probes, parentSim, chunkSim }, ambiguous };
 }
 
 function rankFold(v: FoldVectors, arm: ArmSpec): { rankings: string[][]; contained: boolean[] } {
   const rankings: string[][] = [];
   const contained: boolean[] = [];
+  const k = arm.maxChunks ?? 0;
+  const margin = arm.chunkMargin ?? 0;
   v.probes.forEach((probe, pi) => {
-    const q = v.probeVecs[pi];
-    const scores = v.keys.map((_, ri) =>
-      arm.splitter === null
-        ? cosine(q, v.parent[ri])
-        : pooledScore(q, v.parent[ri], v.chunkVecs[arm.splitter][ri], arm.maxChunks ?? 0, arm.chunkMargin ?? 0),
-    );
+    // The same arithmetic as pooledScore, over the cached similarities.
+    const scores = v.keys.map((_, ri) => {
+      let best = v.parentSim[pi][ri];
+      if (arm.splitter !== null) {
+        const sims = v.chunkSim[arm.splitter][pi][ri];
+        for (let c = 0; c < Math.min(k, sims.length); c++) best = Math.max(best, sims[c] - margin);
+      }
+      return best;
+    });
     rankings.push(rankKeys(v.keys, scores, probe.key));
     if (arm.splitter !== null) {
       const ri = v.keys.indexOf(probe.key);
