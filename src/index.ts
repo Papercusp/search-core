@@ -48,3 +48,33 @@ export {
 
 // Two-stage orchestrator
 export { rankWithReranker, type RankDoc, type RankWithRerankerOptions } from './rank';
+
+// Chunking retrieval bench: rank-based past-the-window gain and short-row
+// demotion, with the corpus, splitters and embedder injected.
+export {
+  runChunkingBench,
+  decideChunking,
+  drawTailProbe,
+  drawShortProbe,
+  isDistinctiveProbe,
+  rankKeys,
+  summarizeRankings,
+  pooledScore,
+  cosine,
+  type BenchEmbed,
+  type BenchEmbedKind,
+  type BenchRow,
+  type BenchSplitter,
+  type BenchProbe,
+  type BenchFold,
+  type ProbeClass,
+  type TailProbeOptions,
+  type ChunkingBenchInput,
+  type ChunkingBenchResult,
+  type ArmResult,
+  type ArmClassResult,
+  type RankSummary,
+  type SplitterStats,
+  type ChunkingDecisionRule,
+  type ChunkingDecision,
+} from './retrieval-bench';
