@@ -15,8 +15,16 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { runWidthSweep } from './width-sweep';
+import * as realSubject from './width-sweep';
 import { fixtureCorpus, fixtureEmbed } from './width-sweep.fixture';
+
+// Copy-out mutation probes (scripts/mutation-probe.sh) point this at a mutant in a repo
+// mirror, so falsifiability is proven without ever dirtying the shared tree.
+const subjectPath = process.env.SEARCH_CORE_WIDTH_SWEEP_SUBJECT;
+const subject: typeof realSubject = subjectPath
+  ? ((await import(subjectPath)) as typeof realSubject)
+  : realSubject;
+const { runWidthSweep } = subject;
 
 interface Golden {
   width: number;
