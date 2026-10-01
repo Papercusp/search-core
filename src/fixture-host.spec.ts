@@ -35,24 +35,39 @@ interface HostModel {
 
 /** The catalogue's model list. */
 const MODELS: readonly HostModel[] = [
-  { id: 'herbarium-bow-short', dims: 96, windowChars: 900 },
+  { id: 'herbarium-bow-short', dims: 512, windowChars: 900 },
   { id: 'herbarium-bow-long', dims: 1000, windowChars: 4000 },
 ];
 const SHORT = MODELS[0]!;
 const LONG = MODELS[1]!;
 
-function fnv1a(word: string): number {
+/**
+ * FNV-1a followed by murmur3's finalizer. Plain FNV-1a spreads words that differ
+ * only in their last letters poorly modulo a non-power-of-two width, which put
+ * unrelated notes within 0.01 cosine of the true one; the finalizer mixes every
+ * input bit into the low bits.
+ */
+function wordHash(word: string): number {
   let h = 0x811c9dc5;
   for (let i = 0; i < word.length; i++) h = Math.imul(h ^ word.charCodeAt(i), 0x01000193);
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
   return h >>> 0;
 }
 
-/** The model's embedder, recording the width of every vector it emits. */
+/**
+ * The model's embedder, recording the width of every vector it emits. It marks
+ * word PRESENCE, not frequency: with counts, the repeated boilerplate dominates
+ * every vector's norm and hash collisions with it decide the ranking.
+ */
 function embedderFor(model: HostModel, widths: number[]): BenchEmbed {
   return async (_kind, texts) =>
     texts.map((text) => {
       const v = new Array<number>(model.dims).fill(0);
-      for (const word of text.slice(0, model.windowChars).split(/\s+/).filter(Boolean)) v[fnv1a(word) % model.dims] += 1;
+      for (const word of text.slice(0, model.windowChars).split(/\s+/).filter(Boolean)) v[wordHash(word) % model.dims] = 1;
       widths.push(v.length);
       return v;
     });
@@ -74,10 +89,10 @@ function suffix(n: number): string {
   return s;
 }
 
-/** Boilerplate, then 60 words only this specimen's note contains. */
+/** Boilerplate, then 100 words only this specimen's note contains. */
 const NOTES = SPECIES.map((species) => ({
   key: `sheet-${species}`,
-  text: HEAD + Array.from({ length: 60 }, (_, j) => `${species}${suffix(j)}`).join(' '),
+  text: HEAD + Array.from({ length: 100 }, (_, j) => `${species}${suffix(j)}`).join(' '),
 }));
 
 describe('fixture host: width sweep over the catalogue model list', () => {
