@@ -91,11 +91,29 @@ function sourceFiles(dir: string): string[] {
   });
 }
 
+/**
+ * Falsifiability seam: `<library-relative path>=<file>` scans that file's text
+ * in place of the tracked source at the path, so a copy-out mutation probe can
+ * plant an import without touching the tree. Unset in every normal run.
+ */
+const OVERRIDE = ((): { rel: string; path: string } | null => {
+  const v = process.env.PAPERCUSP_SEARCH_CORE_IMPORT_BOUNDARY_SUBJECT;
+  if (!v) return null;
+  const i = v.indexOf('=');
+  if (i <= 0) throw new Error(`PAPERCUSP_SEARCH_CORE_IMPORT_BOUNDARY_SUBJECT must be <path>=<file>, got '${v}'`);
+  return { rel: v.slice(0, i), path: v.slice(i + 1) };
+})();
+
 /** Every violation in the library's real src/ tree, as `file: 'spec' (why)`. */
 function scanViolations(): string[] {
   const violations: string[] = [];
-  for (const file of sourceFiles(SRC)) {
-    for (const spec of importSpecifiers(readFileSync(file, 'utf8'))) {
+  const files = sourceFiles(SRC);
+  if (OVERRIDE && !files.some((f) => relative(LIB_ROOT, f) === OVERRIDE.rel)) {
+    throw new Error(`override names '${OVERRIDE.rel}', which is not a source file of the library`);
+  }
+  for (const file of files) {
+    const text = OVERRIDE && relative(LIB_ROOT, file) === OVERRIDE.rel ? readFileSync(OVERRIDE.path, 'utf8') : readFileSync(file, 'utf8');
+    for (const spec of importSpecifiers(text)) {
       const why = importViolation(spec) ?? (escapesLibrary(file, spec) ? 'relative path leaves the library' : null);
       if (why) violations.push(`${relative(LIB_ROOT, file)}: '${spec}' (${why})`);
     }

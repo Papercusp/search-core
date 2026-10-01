@@ -16,14 +16,17 @@
  * last; a vector that sees past it finds the right note.
  */
 import { describe, expect, it } from 'vitest';
-import {
-  drawTailProbe,
-  runChunkingBench,
-  runWidthSweep,
-  type BenchEmbed,
-  type BenchRow,
-  type BenchSplitter,
-} from './index';
+import * as entry from './index';
+import type { BenchEmbed, BenchRow, BenchSplitter } from './index';
+
+/**
+ * Falsifiability seam. A copy-out mutation probe sets this to the entry of a
+ * mirrored copy of src/ so a mutant library is loaded without touching the
+ * tracked source. Unset in every normal run.
+ */
+const SUBJECT = process.env.PAPERCUSP_SEARCH_CORE_FIXTURE_HOST_SUBJECT;
+const lib: typeof entry = SUBJECT ? ((await import(SUBJECT)) as typeof entry) : entry;
+const { drawTailProbe, runChunkingBench, runWidthSweep } = lib;
 
 interface HostModel {
   id: string;
