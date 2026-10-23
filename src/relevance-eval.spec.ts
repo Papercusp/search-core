@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { ndcgAtK } from './metrics';
-import { assertRelevance, evaluateRelevance, recallAtK } from './relevance-eval';
+import {
+  assertRelevance, assertSearchEvaluation, evaluateRelevance, recallAtK,
+  type SearchEvaluationDeclaration, type SearchEvaluationRun,
+} from './relevance-eval';
 
 /**
  * A ranked item: an id plus the grade a derived judgement would give it.
@@ -182,5 +185,161 @@ describe('assertRelevance — refuses a vacuous run instead of scoring it', () =
     const got = assertRelevance(out, { minRecallAtK: 0.5 });
     expect(got.ok).toBe(false);
     expect(got.failures[0]).toContain('VACUOUS');
+  });
+});
+describe('frozen search evaluation populations', () => {
+  function fixture(): { baseline: SearchEvaluationDeclaration; run: SearchEvaluationRun } {
+    const baseline: SearchEvaluationDeclaration = {
+      declaredAtMs: 100,
+      pins: { sourceRevision: 'source-v1', corpus: 'corpus-v1', querySet: 'queries-v1', modelConfiguration: 'model-v1' },
+      cells: ['cold', 'warm'].map(temperature => ({
+        id: temperature, product: 'catalog', adapter: 'actual-catalog', queryClass: 'exact-id',
+        temperature: temperature as 'cold' | 'warm', attemptIds: [`${temperature}-1`, `${temperature}-2`],
+        minExecuted: 2, minJudged: 2, budgetSource: 'decision:pre-treatment-target',
+        maxP95LatencyMs: 200, maxPerAttemptCostUsd: 0.01, maxErrorRate: 0, maxDegradedRate: 0,
+        quality: { minRecallAtK: 1 },
+      })),
+    };
+    const run: SearchEvaluationRun = {
+      startedAtMs: 200, declaration: structuredClone(baseline), pins: { ...baseline.pins },
+      attempts: baseline.cells.flatMap(cell => cell.attemptIds.map(id => ({
+        id, cellId: cell.id, outcome: 'success' as const, executed: true, degraded: false,
+        latencyMs: 50, costUsd: 0.001, resultCount: 1,
+        quality: evaluateRelevance({ ranked: ['found'], grade: () => 3, groundTruth: { ids: ['found'], idOf: x => x } }),
+      }))),
+    };
+    return { baseline, run };
+  }
+
+  it('accepts complete predeclared cells and retains separate denominators', () => {
+    const { baseline, run } = fixture();
+    const result = assertSearchEvaluation(baseline, run);
+    expect(result.status).toBe('pass');
+    expect(result.cells).toEqual(['cold', 'warm'].map(id => ({ id, attempted: 2, eligible: 2, executed: 2, judged: 2, censored: 0 })));
+  });
+
+  it.each(['sourceRevision', 'corpus', 'querySet', 'modelConfiguration'] as const)('rejects an absent %s pin', key => {
+    const { baseline, run } = fixture();
+    baseline.pins[key] = '';
+    expect(assertSearchEvaluation(baseline, run).status).toBe('fail');
+  });
+
+  it('rejects changed actual inputs even when the declaration was copied faithfully', () => {
+    const { baseline, run } = fixture();
+    run.pins.corpus = 'different-corpus';
+    expect(assertSearchEvaluation(baseline, run).failures).toContain('manifest: corpus changed');
+  });
+
+  it('rejects a post-run declaration and changes to budgets, populations, or minimum coverage', () => {
+    for (const edit of [
+      (r: SearchEvaluationRun) => { r.declaration.cells[0].maxP95LatencyMs = 999; },
+      (r: SearchEvaluationRun) => { r.declaration.cells[0].attemptIds = ['cold-1']; },
+      (r: SearchEvaluationRun) => { r.declaration.cells[0].minJudged = 1; },
+      (r: SearchEvaluationRun) => { r.startedAtMs = 100; },
+    ]) {
+      const { baseline, run } = fixture(); edit(run);
+      expect(assertSearchEvaluation(baseline, run).status).toBe('fail');
+    }
+  });
+
+  it('keeps an omitted failure unknown instead of shrinking its denominator', () => {
+    const { baseline, run } = fixture();
+    run.attempts = run.attempts.filter(a => a.id !== 'cold-2');
+    const result = assertSearchEvaluation(baseline, run);
+    expect(result.status).toBe('unknown');
+    expect(result.cells[0]).toMatchObject({ attempted: 2, executed: 1, judged: 1 });
+  });
+
+  it('fails on an observed timeout and cannot hide it behind the other cell', () => {
+    const { baseline, run } = fixture();
+    run.attempts[0].outcome = 'timeout';
+    expect(assertSearchEvaluation(baseline, run).failures).toContain('cold: uncensored timeout cold-1');
+  });
+
+  it('allows predeclared censoring but requires its receipt and preserves its population', () => {
+    const { baseline, run } = fixture();
+    baseline.cells[0].censoring = { attemptIds: ['cold-2'], reason: 'predeclared calibration attempt' };
+    baseline.cells[0].minExecuted = baseline.cells[0].minJudged = 1;
+    run.declaration = structuredClone(baseline);
+    run.attempts[1].outcome = 'timeout';
+    expect(assertSearchEvaluation(baseline, run).cells[0]).toMatchObject({ attempted: 2, eligible: 1, censored: 1 });
+    expect(assertSearchEvaluation(baseline, run).status).toBe('pass');
+    run.attempts = run.attempts.filter(a => a.id !== 'cold-2');
+    expect(assertSearchEvaluation(baseline, run).status).toBe('unknown');
+  });
+
+  it('rejects duplicate and cross-cell receipts', () => {
+    const { baseline, run } = fixture();
+    run.attempts = [...run.attempts, { ...run.attempts[0], cellId: 'warm' }];
+    expect(assertSearchEvaluation(baseline, run).status).toBe('fail');
+  });
+
+  it('does not let cheap/fast warm results mask a cold budget miss', () => {
+    const { baseline, run } = fixture();
+    run.attempts[0].latencyMs = 201;
+    run.attempts[0].costUsd = 0.02;
+    run.attempts[0].degraded = true;
+    expect(assertSearchEvaluation(baseline, run).failures).toEqual(expect.arrayContaining([
+      'cold: p95 latency exceeded', 'cold: cost exceeded cold-1', 'cold: degraded rate exceeded',
+    ]));
+  });
+
+  it('keeps missing costs, judgments and unknown outcomes unknown', () => {
+    const { baseline, run } = fixture();
+    run.attempts[0].costUsd = null;
+    run.attempts[0].quality = undefined;
+    run.attempts[1].outcome = 'unknown';
+    expect(assertSearchEvaluation(baseline, run).status).toBe('unknown');
+  });
+
+  it('cannot pass nonfinite metric measurements through JavaScript comparisons', () => {
+    const { baseline, run } = fixture();
+    run.attempts[0].quality!.recallAtK = Number.NaN;
+    expect(assertSearchEvaluation(baseline, run).status).toBe('unknown');
+  });
+
+  it('keeps out-of-scale quality measurements unknown', () => {
+    const { baseline, run } = fixture();
+    run.attempts[0].quality!.recallAtK = 2;
+    expect(assertSearchEvaluation(baseline, run).status).toBe('unknown');
+  });
+
+  it('fails a measured quality miss using the existing relevance floor', () => {
+    const { baseline, run } = fixture();
+    run.attempts[0].quality = evaluateRelevance({ ranked: ['wrong'], grade: () => 3, groundTruth: { ids: ['found'], idOf: x => x } });
+    expect(assertSearchEvaluation(baseline, run).status).toBe('fail');
+  });
+
+  it('rejects a duplicate population under a different label', () => {
+    const { baseline, run } = fixture();
+    baseline.cells[1].temperature = 'cold';
+    run.declaration = structuredClone(baseline);
+    expect(assertSearchEvaluation(baseline, run).failures).toContain('warm: duplicate population');
+  });
+
+  it('rejects unmeasured budget declarations and rate ceilings outside their units', () => {
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, -1, 2]) {
+      const { baseline, run } = fixture();
+      baseline.cells[0].maxErrorRate = value;
+      run.declaration = structuredClone(baseline);
+      expect(assertSearchEvaluation(baseline, run).status).toBe('fail');
+    }
+  });
+
+  it('reports an undersized declared cell as unknown', () => {
+    const { baseline, run } = fixture();
+    baseline.cells[0].minJudged = 3;
+    run.declaration = structuredClone(baseline);
+    expect(assertSearchEvaluation(baseline, run).status).toBe('unknown');
+  });
+
+  it('judges a declared no-match case separately from vacuous ranking metrics', () => {
+    const { baseline, run } = fixture();
+    baseline.cells[0].quality = 'no-match';
+    run.declaration = structuredClone(baseline);
+    for (const a of run.attempts.filter(a => a.cellId === 'cold')) { a.resultCount = 0; a.quality = undefined; }
+    expect(assertSearchEvaluation(baseline, run).status).toBe('pass');
+    run.attempts[0].resultCount = 1;
+    expect(assertSearchEvaluation(baseline, run).status).toBe('fail');
   });
 });

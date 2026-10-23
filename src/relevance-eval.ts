@@ -51,6 +51,209 @@
 
 import { accessoryAtK, ndcgAtK, precisionAtK } from './metrics';
 
+/** Immutable inputs shared by a baseline and its treatment. Versions are host-defined. */
+export interface SearchEvaluationPins {
+  sourceRevision: string;
+  corpus: string;
+  querySet: string;
+  modelConfiguration: string;
+}
+
+/** One independently judged population; budgets must never be pooled across cells. */
+export interface SearchEvaluationCell {
+  id: string;
+  product: string;
+  adapter: string;
+  queryClass: string;
+  temperature: 'cold' | 'warm';
+  attemptIds: readonly string[];
+  minExecuted: number;
+  minJudged: number;
+  /** Reference to the accepted target or the pre-treatment target decision. */
+  budgetSource: string;
+  maxP95LatencyMs: number;
+  maxPerAttemptCostUsd: number;
+  maxErrorRate: number;
+  maxDegradedRate: number;
+  quality: RelevanceFloor | 'no-match';
+  /** Explicit predeclared exclusions; they remain in population accounting. */
+  censoring?: { attemptIds: readonly string[]; reason: string };
+}
+
+export interface SearchEvaluationDeclaration {
+  declaredAtMs: number;
+  pins: SearchEvaluationPins;
+  cells: readonly SearchEvaluationCell[];
+}
+
+export interface SearchEvaluationAttempt {
+  id: string;
+  cellId: string;
+  outcome: 'success' | 'timeout' | 'error' | 'unknown';
+  executed: boolean;
+  degraded: boolean;
+  latencyMs: number | null;
+  costUsd: number | null;
+  /** Required to judge a successful no-match case without treating it as vacuous relevance. */
+  resultCount: number | null;
+  quality?: RelevanceEvalResult;
+}
+
+export interface SearchEvaluationRun {
+  startedAtMs: number;
+  declaration: SearchEvaluationDeclaration;
+  /** Actual inputs used by the runner, independently of its copied declaration. */
+  pins: SearchEvaluationPins;
+  attempts: readonly SearchEvaluationAttempt[];
+}
+
+export interface SearchEvaluationAssertion {
+  status: 'pass' | 'fail' | 'unknown';
+  failures: string[];
+  unknowns: string[];
+  cells: Array<{ id: string; attempted: number; eligible: number; executed: number; judged: number; censored: number }>;
+}
+
+/** Canonical JSON identity without a crypto/runtime dependency or object-key-order sensitivity. */
+function evaluationIdentity(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(evaluationIdentity).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.entries(value).filter(([, v]) => v !== undefined).sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${JSON.stringify(k)}:${evaluationIdentity(v)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'undefined';
+}
+
+/**
+ * Validate a frozen, pinned benchmark against its complete attempt ledger.
+ * A good aggregate cannot cover a missing cell. Unknown/missing attempts and
+ * undersized cells stay unknown; observed budget misses and rewritten inputs fail.
+ * This extends the relevance harness rather than introducing another metric definition.
+ */
+export function assertSearchEvaluation(
+  baseline: SearchEvaluationDeclaration,
+  run: SearchEvaluationRun,
+): SearchEvaluationAssertion {
+  const failures: string[] = [];
+  const unknowns: string[] = [];
+  const cells: SearchEvaluationAssertion['cells'] = [];
+  const fail = (id: string, message: string) => failures.push(`${id}: ${message}`);
+  const unknown = (id: string, message: string) => unknowns.push(`${id}: ${message}`);
+  const nonnegative = (n: number | null): n is number => n !== null && Number.isFinite(n) && n >= 0;
+  const pinNames: Array<keyof SearchEvaluationPins> = ['sourceRevision', 'corpus', 'querySet', 'modelConfiguration'];
+  for (const key of pinNames) {
+    if (!baseline.pins[key]?.trim()) fail('manifest', `missing ${key} pin`);
+    if (run.pins[key] !== baseline.pins[key]) fail('manifest', `${key} changed`);
+  }
+  if (!nonnegative(baseline.declaredAtMs) || !nonnegative(run.startedAtMs) || baseline.declaredAtMs >= run.startedAtMs) {
+    fail('manifest', 'declaration must precede the run');
+  }
+  if (evaluationIdentity(baseline) !== evaluationIdentity(run.declaration)) fail('manifest', 'declaration changed');
+  if (!baseline.cells.length) unknown('manifest', 'no declared cells');
+
+  const expected = new Map<string, string>();
+  const cellIds = new Set<string>();
+  const populations = new Set<string>();
+  for (const cell of baseline.cells) {
+    if (!cell.id.trim() || cellIds.has(cell.id)) fail(cell.id, 'missing or duplicate cell id');
+    cellIds.add(cell.id);
+    const population = evaluationIdentity([cell.product, cell.adapter, cell.queryClass, cell.temperature]);
+    if (![cell.product, cell.adapter, cell.queryClass].every(v => v.trim()) || !['cold', 'warm'].includes(cell.temperature)) {
+      fail(cell.id, 'incomplete population identity');
+    }
+    if (populations.has(population)) fail(cell.id, 'duplicate population');
+    populations.add(population);
+    if (!cell.budgetSource.trim()) fail(cell.id, 'missing budget source');
+    for (const key of ['maxP95LatencyMs', 'maxPerAttemptCostUsd', 'maxErrorRate', 'maxDegradedRate'] as const) {
+      if (!nonnegative(cell[key]) || (key.endsWith('Rate') && cell[key] > 1)) fail(cell.id, `invalid ${key}`);
+    }
+    for (const id of cell.attemptIds) {
+      if (!id.trim() || expected.has(id)) fail(cell.id, 'missing or duplicate attempt identity');
+      expected.set(id, cell.id);
+    }
+  }
+  const observed = new Map<string, SearchEvaluationAttempt>();
+  for (const attempt of run.attempts) {
+    if (observed.has(attempt.id)) fail(attempt.cellId, `duplicate receipt ${attempt.id}`);
+    observed.set(attempt.id, attempt);
+    if (expected.get(attempt.id) !== attempt.cellId) fail(attempt.cellId, `undeclared or wrong-cell receipt ${attempt.id}`);
+  }
+
+  for (const cell of baseline.cells) {
+    const censored = new Set(cell.censoring?.attemptIds ?? []);
+    if (cell.censoring && (!cell.censoring.reason.trim() || censored.size !== cell.censoring.attemptIds.length)) {
+      fail(cell.id, 'invalid censoring declaration');
+    }
+    for (const id of censored) if (!cell.attemptIds.includes(id)) fail(cell.id, `undeclared censor ${id}`);
+    const eligible = cell.attemptIds.filter(id => !censored.has(id));
+    for (const key of ['minExecuted', 'minJudged'] as const) {
+      if (!Number.isInteger(cell[key]) || cell[key] < 1) fail(cell.id, `invalid ${key}`);
+      else if (cell[key] > eligible.length) unknown(cell.id, `undersized declared population for ${key}`);
+    }
+    if (cell.quality !== 'no-match') {
+      const bounds = Object.entries(cell.quality);
+      if (!bounds.length) fail(cell.id, 'missing quality target');
+      for (const [key, value] of bounds) {
+        if (!['minNdcgAtK', 'minPrecisionAtK', 'minRecallAtK', 'maxAccessoryAtK'].includes(key) ||
+            !nonnegative(value) || (key !== 'maxAccessoryAtK' && value > 1)) fail(cell.id, `invalid quality target ${key}`);
+      }
+    }
+    let executed = 0;
+    let judged = 0;
+    let errors = 0;
+    let degraded = 0;
+    const latencies: number[] = [];
+    for (const id of cell.attemptIds) {
+      const attempt = observed.get(id);
+      if (!attempt || attempt.cellId !== cell.id) { unknown(cell.id, `missing receipt ${id}`); continue; }
+      // Even a censored record must exist. Its omission cannot shrink the population.
+      if (censored.has(id)) continue;
+      if (!['success', 'timeout', 'error', 'unknown'].includes(attempt.outcome)) {
+        unknown(cell.id, `unrecognized outcome ${id}`);
+        continue;
+      }
+      if (attempt.executed) executed++;
+      if (attempt.outcome === 'unknown') unknown(cell.id, `unknown outcome ${id}`);
+      if (attempt.outcome === 'error' || attempt.outcome === 'timeout') errors++;
+      if (attempt.outcome === 'timeout') fail(cell.id, `uncensored timeout ${id}`);
+      if (attempt.degraded) degraded++;
+      if (nonnegative(attempt.latencyMs)) latencies.push(attempt.latencyMs);
+      else unknown(cell.id, `unmeasured latency ${id}`);
+      if (!nonnegative(attempt.costUsd)) unknown(cell.id, `unmeasured cost ${id}`);
+      else if (attempt.costUsd > cell.maxPerAttemptCostUsd) fail(cell.id, `cost exceeded ${id}`);
+      if (attempt.outcome !== 'success') continue;
+      if (!attempt.executed) { fail(cell.id, `success without execution ${id}`); continue; }
+      if (cell.quality === 'no-match') {
+        if (attempt.resultCount === null) unknown(cell.id, `unmeasured no-match ${id}`);
+        else if (attempt.resultCount !== 0) fail(cell.id, `unexpected matches ${id}`);
+        else judged++;
+      } else if (!attempt.quality) unknown(cell.id, `unjudged ${id}`);
+      else {
+        const fractions = [attempt.quality.ndcgAtK, attempt.quality.precisionAtK];
+        if (attempt.quality.recallAtK !== null) fractions.push(attempt.quality.recallAtK);
+        if (!fractions.every(n => nonnegative(n) && n <= 1) ||
+            !Number.isInteger(attempt.quality.k) || attempt.quality.k < 1 ||
+            !Number.isInteger(attempt.quality.accessoryAtK) || attempt.quality.accessoryAtK < 0 ||
+            attempt.quality.accessoryAtK > attempt.quality.k ||
+            !attempt.quality.grades.every(n => nonnegative(n) && n <= 3)) {
+          unknown(cell.id, `invalid quality measurement ${id}`);
+          continue;
+        }
+        const quality = assertRelevance(attempt.quality, cell.quality);
+        if (!quality.ok) fail(cell.id, `quality failed ${id}: ${quality.failures.join('; ')}`);
+        judged++;
+      }
+    }
+    if (executed < cell.minExecuted || judged < cell.minJudged) unknown(cell.id, 'undersized executed/judged population');
+    if (eligible.length && errors / eligible.length > cell.maxErrorRate) fail(cell.id, 'error rate exceeded');
+    if (eligible.length && degraded / eligible.length > cell.maxDegradedRate) fail(cell.id, 'degraded rate exceeded');
+    latencies.sort((a, b) => a - b);
+    if (latencies.length && latencies[Math.ceil(latencies.length * 0.95) - 1] > cell.maxP95LatencyMs) fail(cell.id, 'p95 latency exceeded');
+    cells.push({ id: cell.id, attempted: cell.attemptIds.length, eligible: eligible.length, executed, judged, censored: censored.size });
+  }
+  return { status: failures.length ? 'fail' : unknowns.length ? 'unknown' : 'pass', failures, unknowns, cells };
+}
+
 /**
  * Whether this evaluation MEASURED anything.
  *
