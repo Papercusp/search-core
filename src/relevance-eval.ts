@@ -114,6 +114,107 @@ export interface SearchEvaluationAssertion {
   cells: Array<{ id: string; attempted: number; eligible: number; executed: number; judged: number; censored: number }>;
 }
 
+/** A predeclared boundary for ONE field, independent of the result envelope's time. */
+export interface SearchFieldFreshnessPolicy {
+  fieldPath: string;
+  authority: string;
+  clock: 'canonical-read' | 'index-observation';
+  maxAgeMs: number;
+  maxFutureSkewMs: number;
+  readAfterWrite: 'required' | 'not-promised';
+  onUnknown: 'degrade' | 'refuse';
+}
+
+/** Host-computed fingerprints bind a witness to the returned field, not just its row. */
+export interface SearchFieldVersion {
+  entityRef: string;
+  fieldPath: string;
+  valueFingerprint: string;
+  sourceRevision: string;
+  authority: string;
+  authorityEpoch: string;
+}
+
+export interface SearchFieldFreshnessInput {
+  returned: Pick<SearchFieldVersion, 'entityRef' | 'fieldPath' | 'valueFingerprint'>;
+  /** Collected by the adapter with the candidate. A copied envelope is not evidence. */
+  indexed: (SearchFieldVersion & { indexRevision: string; observedAtMs: number }) | null;
+  /** Independently resolved by the trusted host in the CURRENT scope/authority epoch. */
+  canonical: (SearchFieldVersion & { readAtMs: number }) | null;
+  requestStartedAtMs: number;
+  responseAtMs: number;
+  /** If read-your-writes was promised, the host supplies its committed write revision. */
+  requiredWriteRevision?: string;
+}
+
+export interface SearchFieldFreshnessAssertion {
+  status: 'current' | 'stale' | 'unknown';
+  action: 'accept' | 'degrade' | 'refuse';
+  reasons: string[];
+}
+
+/**
+ * Judge a field against a frozen policy and a separate current-authority read.
+ * This does not fetch, authenticate, hydrate, or recover omitted candidates; hosts
+ * own those operations. Missing canonical proof remains unknown through merges.
+ */
+export function assertSearchFieldFreshness(
+  policy: SearchFieldFreshnessPolicy,
+  input: SearchFieldFreshnessInput,
+): SearchFieldFreshnessAssertion {
+  const stale: string[] = [];
+  const unknown: string[] = [];
+  const finiteTime = (n: number) => Number.isFinite(n) && n >= 0;
+  const nonempty = (s: string) => typeof s === 'string' && s.trim().length > 0;
+  if (!nonempty(policy.fieldPath) || !nonempty(policy.authority) ||
+      !['canonical-read', 'index-observation'].includes(policy.clock) ||
+      !['required', 'not-promised'].includes(policy.readAfterWrite) ||
+      !['degrade', 'refuse'].includes(policy.onUnknown) ||
+      !finiteTime(policy.maxAgeMs) || !finiteTime(policy.maxFutureSkewMs)) unknown.push('invalid field policy');
+  if (!finiteTime(input.requestStartedAtMs) || !finiteTime(input.responseAtMs) ||
+      input.responseAtMs < input.requestStartedAtMs) unknown.push('invalid or rolled-back response clock');
+  if (!Object.values(input.returned).every(nonempty) || input.returned.fieldPath !== policy.fieldPath)
+    unknown.push('returned field identity is missing or outside the policy');
+  const { indexed, canonical } = input;
+  if (!indexed) unknown.push('index witness unavailable');
+  if (!canonical) unknown.push('canonical authority unavailable');
+  for (const [label, version] of [['index', indexed], ['canonical', canonical]] as const) {
+    if (!version) continue;
+    for (const key of ['entityRef', 'fieldPath', 'valueFingerprint', 'sourceRevision', 'authority', 'authorityEpoch'] as const) {
+      if (!nonempty(version[key])) unknown.push(`${label}: missing ${key}`);
+    }
+    if (version.entityRef !== input.returned.entityRef || version.fieldPath !== input.returned.fieldPath)
+      stale.push(`${label}: wrong entity or field`);
+    if (version.valueFingerprint !== input.returned.valueFingerprint) stale.push(`${label}: returned value differs`);
+    if (version.authority !== policy.authority) stale.push(`${label}: wrong authority`);
+  }
+  if (indexed && !nonempty(indexed.indexRevision)) unknown.push('index revision unavailable');
+  if (indexed && canonical) {
+    if (indexed.sourceRevision !== canonical.sourceRevision) stale.push('source/index revision disagreement');
+    if (indexed.authorityEpoch !== canonical.authorityEpoch) stale.push('authority epoch changed');
+    const withinClock = (label: string, at: number) => {
+      if (!finiteTime(at)) unknown.push(`${label}: clock unavailable`);
+      else if (at > input.responseAtMs + policy.maxFutureSkewMs) unknown.push(`${label}: future clock outside skew`);
+    };
+    withinClock('index', indexed.observedAtMs);
+    withinClock('canonical', canonical.readAtMs);
+    if (indexed.observedAtMs > canonical.readAtMs + policy.maxFutureSkewMs)
+      unknown.push('index observation is newer than the authority read');
+    const boundaryAt = policy.clock === 'canonical-read' ? canonical.readAtMs : indexed.observedAtMs;
+    if (input.responseAtMs - boundaryAt > policy.maxAgeMs) stale.push('field freshness boundary exceeded');
+    if (policy.clock === 'canonical-read' && canonical.readAtMs < input.requestStartedAtMs)
+      stale.push('canonical validation predates the request');
+    if (policy.readAfterWrite === 'required') {
+      if (!nonempty(input.requiredWriteRevision ?? '')) unknown.push('committed write revision unavailable');
+      else if (canonical.sourceRevision !== input.requiredWriteRevision) stale.push('committed write revision not observed');
+      if (canonical.readAtMs < input.requestStartedAtMs) stale.push('read-after-write validation predates the request');
+    }
+  }
+  const status = stale.length ? 'stale' : unknown.length ? 'unknown' : 'current';
+  return { status, action: status === 'current' ? 'accept' : policy.onUnknown === 'degrade' ? 'degrade' : 'refuse',
+    reasons: [...stale, ...unknown] };
+}
+
 /** Canonical JSON identity without a crypto/runtime dependency or object-key-order sensitivity. */
 function evaluationIdentity(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(evaluationIdentity).join(',')}]`;

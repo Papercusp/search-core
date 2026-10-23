@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { ndcgAtK } from './metrics';
 import {
-  assertRelevance, assertSearchEvaluation, evaluateRelevance, recallAtK,
+  assertRelevance, assertSearchEvaluation, assertSearchFieldFreshness, evaluateRelevance, recallAtK,
+  type SearchFieldFreshnessPolicy, type SearchFieldFreshnessInput,
   type SearchEvaluationDeclaration, type SearchEvaluationRun,
 } from './relevance-eval';
 
@@ -187,6 +188,93 @@ describe('assertRelevance — refuses a vacuous run instead of scoring it', () =
     expect(got.failures[0]).toContain('VACUOUS');
   });
 });
+describe('field-bound freshness evidence', () => {
+  function fixture(): { policy: SearchFieldFreshnessPolicy; input: SearchFieldFreshnessInput } {
+    const version = { entityRef: 'record:one', fieldPath: 'status', valueFingerprint: 'hash:open',
+      sourceRevision: 'rev:2', authority: 'canonical-store', authorityEpoch: 'scope:2' };
+    return {
+      policy: { fieldPath: 'status', authority: 'canonical-store', clock: 'canonical-read', maxAgeMs: 100,
+        maxFutureSkewMs: 5, readAfterWrite: 'not-promised', onUnknown: 'refuse' },
+      input: { returned: { entityRef: version.entityRef, fieldPath: version.fieldPath, valueFingerprint: version.valueFingerprint },
+        indexed: { ...version, indexRevision: 'index:2', observedAtMs: 950 },
+        canonical: { ...version, readAtMs: 990 }, requestStartedAtMs: 980, responseAtMs: 1000 },
+    };
+  }
+
+  it('admits a field validated against the current authority during the request', () => {
+    const { policy, input } = fixture();
+    expect(assertSearchFieldFreshness(policy, input)).toEqual({ status: 'current', action: 'accept', reasons: [] });
+  });
+
+  it.each(['entityRef', 'fieldPath', 'valueFingerprint', 'sourceRevision', 'authority', 'authorityEpoch'] as const)(
+    'a fresh envelope cannot hide a mismatched %s', key => {
+      const { policy, input } = fixture(); input.indexed![key] = 'stale-or-foreign';
+      input.indexed!.observedAtMs = 990;
+      expect(assertSearchFieldFreshness(policy, input).status).toBe('stale');
+    });
+
+  it('rejects mixed-version field hydration even when the row revision matches', () => {
+    const { policy, input } = fixture(); input.returned.valueFingerprint = 'hash:closed';
+    expect(assertSearchFieldFreshness(policy, input).status).toBe('stale');
+  });
+
+  it('keeps an unavailable canonical read unknown, including on degraded output', () => {
+    const { policy, input } = fixture(); input.canonical = null; policy.onUnknown = 'degrade';
+    expect(assertSearchFieldFreshness(policy, input)).toMatchObject({ status: 'unknown', action: 'degrade' });
+  });
+
+  it('does not manufacture freshness from an unknown index revision or field clock', () => {
+    for (const edit of [
+      (i: SearchFieldFreshnessInput) => { i.indexed!.indexRevision = ''; },
+      (i: SearchFieldFreshnessInput) => { i.indexed!.observedAtMs = Number.NaN; },
+      (i: SearchFieldFreshnessInput) => { i.canonical!.readAtMs = Number.NaN; },
+    ]) {
+      const { policy, input } = fixture(); edit(input);
+      expect(assertSearchFieldFreshness(policy, input).status).toBe('unknown');
+    }
+  });
+
+  it('rejects a cached field replayed after revocation despite a fresh cache observation', () => {
+    const { policy, input } = fixture(); input.canonical!.authorityEpoch = 'revoked:3';
+    input.indexed!.observedAtMs = 995;
+    expect(assertSearchFieldFreshness(policy, input).reasons).toContain('authority epoch changed');
+  });
+
+  it('requires response-time canonical validation for fields promised current', () => {
+    const { policy, input } = fixture(); input.canonical!.readAtMs = 970;
+    expect(assertSearchFieldFreshness(policy, input).reasons).toContain('canonical validation predates the request');
+  });
+
+  it('can use a declared index-age boundary without calling an old value current', () => {
+    const { policy, input } = fixture(); policy.clock = 'index-observation';
+    input.indexed!.observedAtMs = 899;
+    expect(assertSearchFieldFreshness(policy, input).status).toBe('stale');
+    input.indexed!.observedAtMs = 900;
+    expect(assertSearchFieldFreshness(policy, input).status).toBe('current');
+  });
+
+  it('requires the committed revision when read-your-writes is promised', () => {
+    const { policy, input } = fixture(); policy.readAfterWrite = 'required';
+    expect(assertSearchFieldFreshness(policy, input).status).toBe('unknown');
+    input.requiredWriteRevision = 'rev:3';
+    expect(assertSearchFieldFreshness(policy, input).status).toBe('stale');
+    input.requiredWriteRevision = 'rev:2';
+    expect(assertSearchFieldFreshness(policy, input).status).toBe('current');
+  });
+
+  it('keeps rollback, out-of-bound future clocks and invalid policies unknown', () => {
+    for (const edit of [
+      (p: SearchFieldFreshnessPolicy, i: SearchFieldFreshnessInput) => { i.responseAtMs = 970; },
+      (p: SearchFieldFreshnessPolicy, i: SearchFieldFreshnessInput) => { i.canonical!.readAtMs = 1006; },
+      (p: SearchFieldFreshnessPolicy, i: SearchFieldFreshnessInput) => { i.indexed!.observedAtMs = 1006; },
+      (p: SearchFieldFreshnessPolicy) => { p.maxAgeMs = Number.NaN; },
+    ]) {
+      const { policy, input } = fixture(); edit(policy, input);
+      expect(assertSearchFieldFreshness(policy, input).status).not.toBe('current');
+    }
+  });
+});
+
 describe('frozen search evaluation populations', () => {
   function fixture(): { baseline: SearchEvaluationDeclaration; run: SearchEvaluationRun } {
     const baseline: SearchEvaluationDeclaration = {
